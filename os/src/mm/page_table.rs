@@ -1,6 +1,7 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
 use super::{frame_alloc, FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -179,3 +180,88 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     }
     v
 }
+
+/// User virtual addresses must lie in the low canonical half of SV39.
+///
+/// Without this check, an address such as `isize::MAX` would be truncated to
+/// 39 bits and could alias the trampoline page mapped at the top of the
+/// address space.
+fn is_user_va(ptr: usize) -> bool {
+    ptr < (1usize << 38)
+}
+
+/// Translate and read a byte from user space.
+///
+/// Returns `None` if the address is not mapped or is not readable.
+pub fn translated_read_byte(token: usize, ptr: usize) -> Option<u8> {
+    if !is_user_va(ptr) {
+        return None;
+    }
+    let page_table = PageTable::from_token(token);
+    let va = VirtAddr::from(ptr);
+    let pte = page_table.translate(va.floor())?;
+    if !pte.is_valid() || !pte.readable() {
+        return None;
+    }
+    Some(pte.ppn().get_bytes_array()[va.page_offset()])
+}
+
+/// Translate and write a byte into user space.
+///
+/// Returns `false` if the address is not mapped or is not writable.
+pub fn translated_write_byte(token: usize, ptr: usize, data: u8) -> bool {
+    if !is_user_va(ptr) {
+        return false;
+    }
+    let page_table = PageTable::from_token(token);
+    let va = VirtAddr::from(ptr);
+    let pte = match page_table.translate(va.floor()) {
+        Some(pte) if pte.is_valid() && pte.writable() => pte,
+        _ => return false,
+    };
+    pte.ppn().get_bytes_array()[va.page_offset()] = data;
+    true
+}
+
+/// Translate and copy a byte slice into user space.
+///
+/// All the destination pages are checked before copying, so the copy is
+/// all-or-nothing. Returns `false` if any page is not writable.
+pub fn translated_write_buffer(token: usize, ptr: usize, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    let end = match ptr.checked_add(data.len()) {
+        Some(end) => end,
+        None => return false,
+    };
+    if !is_user_va(ptr) || !is_user_va(end - 1) {
+        return false;
+    }
+    let page_table = PageTable::from_token(token);
+    // first check that every page in the range is mapped and writable
+    let mut addr = ptr;
+    while addr < end {
+        let va = VirtAddr::from(addr);
+        match page_table.translate(va.floor()) {
+            Some(pte) if pte.is_valid() && pte.writable() => {}
+            _ => return false,
+        }
+        addr = (va.floor().0 + 1) << PAGE_SIZE_BITS;
+    }
+    // then copy page by page
+    let mut start = ptr;
+    let mut copied = 0;
+    while copied < data.len() {
+        let va = VirtAddr::from(start);
+        let pte = page_table.translate(va.floor()).unwrap();
+        let offset = va.page_offset();
+        let n = core::cmp::min(PAGE_SIZE - offset, data.len() - copied);
+        pte.ppn().get_bytes_array()[offset..offset + n]
+            .copy_from_slice(&data[copied..copied + n]);
+        start += n;
+        copied += n;
+    }
+    true
+}
+

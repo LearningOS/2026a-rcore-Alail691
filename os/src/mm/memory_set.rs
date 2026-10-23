@@ -262,6 +262,47 @@ impl MemorySet {
             false
         }
     }
+
+    /// Whether `[start_vpn, end_vpn)` overlaps any existing area.
+    fn overlaps(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        self.areas.iter().any(|area| {
+            area.vpn_range.get_start() < end_vpn && start_vpn < area.vpn_range.get_end()
+        })
+    }
+
+    /// Map a new anonymous area for `mmap`.
+    ///
+    /// `end_va` is rounded up to a page boundary. The call fails if the
+    /// range is empty or overlaps an existing area.
+    pub fn mmap(&mut self, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if start_vpn >= end_vpn || self.overlaps(start_vpn, end_vpn) {
+            return false;
+        }
+        self.insert_framed_area(start_va, end_va, permission);
+        true
+    }
+
+    /// Unmap an anonymous area created by `mmap`.
+    ///
+    /// Both ends must be page aligned and must exactly match one mapped area.
+    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        if !start_va.aligned() || !end_va.aligned() || start_va >= end_va {
+            return false;
+        }
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.floor();
+        if let Some(idx) = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
+        }) {
+            let mut area = self.areas.remove(idx);
+            area.unmap(&mut self.page_table);
+            true
+        } else {
+            false
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
