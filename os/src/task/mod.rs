@@ -14,7 +14,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::config::MAX_APP_NUM;
+use crate::config::{MAX_APP_NUM, MAX_SYSCALL_NUM};
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
@@ -22,6 +22,13 @@ use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
+
+/// System call counters of every task, indexed by task id.
+///
+/// The counters are kept outside [`TaskControlBlock`] so that the task array
+/// stays small and can be initialized without using a lot of kernel stack.
+static mut SYSCALL_TIMES: [[usize; MAX_SYSCALL_NUM]; MAX_APP_NUM] =
+    [[0; MAX_SYSCALL_NUM]; MAX_APP_NUM];
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -168,4 +175,33 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Get the id of the currently running task.
+pub fn current_task_id() -> usize {
+    TASK_MANAGER.inner.exclusive_access().current_task
+}
+
+/// Record one more system call of `syscall_id` for the current task.
+pub fn add_syscall_count(syscall_id: usize) {
+    if syscall_id >= MAX_SYSCALL_NUM {
+        return;
+    }
+    let task_id = current_task_id();
+    unsafe {
+        let times = core::ptr::addr_of_mut!(SYSCALL_TIMES);
+        (*times)[task_id][syscall_id] += 1;
+    }
+}
+
+/// Get the number of system calls `syscall_id` made by the current task.
+pub fn get_syscall_count(syscall_id: usize) -> usize {
+    if syscall_id >= MAX_SYSCALL_NUM {
+        return 0;
+    }
+    let task_id = current_task_id();
+    unsafe {
+        let times = core::ptr::addr_of!(SYSCALL_TIMES);
+        (*times)[task_id][syscall_id]
+    }
 }
