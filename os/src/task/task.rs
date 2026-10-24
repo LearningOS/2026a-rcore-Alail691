@@ -41,6 +41,8 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
+    /// It is set when the thread is woken up because a deadlock was detected
+    pub deadlock_aborted: bool,
 }
 
 impl TaskControlBlockInner {
@@ -75,6 +77,7 @@ impl TaskControlBlock {
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
                     exit_code: None,
+                    deadlock_aborted: false,
                 })
             },
         }

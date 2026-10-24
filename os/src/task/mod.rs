@@ -23,7 +23,7 @@ use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use crate::task::manager::add_stopping_task;
 use crate::timer::remove_timer;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
 use process::ProcessControlBlock;
@@ -203,4 +203,162 @@ pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     remove_task(Arc::clone(&task));
     trace!("kernel: remove_inactive_task .. remove_timer");
     remove_timer(Arc::clone(&task));
+}
+
+/// The tid of the current task.
+pub fn current_tid() -> usize {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid
+}
+
+/// Whether deadlock detection is enabled in the current process.
+pub fn deadlock_detect_enabled() -> bool {
+    current_process()
+        .inner_exclusive_access()
+        .deadlock_detect
+}
+
+/// Record that the current thread acquired one unit of semaphore `sem_id`.
+pub fn record_sem_alloc(sem_id: usize) {
+    let tid = current_tid();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    inner.ensure_sem_alloc();
+    if tid < inner.sem_alloc.len() && sem_id < inner.sem_alloc[tid].len() {
+        inner.sem_alloc[tid][sem_id] += 1;
+    }
+}
+
+/// Record that the current thread released one unit of semaphore `sem_id`.
+pub fn release_sem_alloc(sem_id: usize) {
+    let tid = current_tid();
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    inner.ensure_sem_alloc();
+    if tid < inner.sem_alloc.len() && sem_id < inner.sem_alloc[tid].len() {
+        inner.sem_alloc[tid][sem_id] = inner.sem_alloc[tid][sem_id].saturating_sub(1);
+    }
+}
+
+/// Take and clear the deadlock-abort flag of the current task.
+pub fn take_deadlock_abort() -> bool {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let flag = inner.deadlock_aborted;
+    inner.deadlock_aborted = false;
+    flag
+}
+
+/// Check whether blocking the current thread on semaphore `sem_id` would
+/// lead to a deadlock (banker's algorithm).
+///
+/// If a deadlock is detected, all the threads involved are woken up with
+/// their abort flag set and `true` is returned; the caller should return
+/// -0xdead to the user program.
+pub fn deadlock_check_on_sem(sem_id: usize) -> bool {
+    let task = match current_task() {
+        Some(task) => task,
+        None => return false,
+    };
+    let tid = match task.inner_exclusive_access().res.as_ref() {
+        Some(res) => res.tid,
+        None => return false,
+    };
+    let process = task.process.upgrade().unwrap();
+    let mut inner = process.inner_exclusive_access();
+    if !inner.deadlock_detect {
+        return false;
+    }
+    inner.ensure_sem_alloc();
+    let ntask = inner.tasks.len();
+    let nsem = inner.semaphore_list.len();
+    // currently available units of every semaphore
+    let mut work = vec![0usize; nsem];
+    // the semaphore every thread is waiting for
+    let mut request: Vec<Option<usize>> = vec![None; ntask];
+    for (sid, sem) in inner.semaphore_list.iter().enumerate() {
+        if let Some(sem) = sem {
+            let sem_inner = sem.inner.exclusive_access();
+            if sem_inner.count > 0 {
+                work[sid] = sem_inner.count as usize;
+            }
+            for waiting in sem_inner.wait_queue.iter() {
+                if let Some(waiting_tid) = waiting
+                    .inner_exclusive_access()
+                    .res
+                    .as_ref()
+                    .map(|res| res.tid)
+                {
+                    if waiting_tid < ntask {
+                        request[waiting_tid] = Some(sid);
+                    }
+                }
+            }
+        }
+    }
+    // the calling thread is waiting for `sem_id`
+    if tid < ntask {
+        request[tid] = Some(sem_id);
+    }
+    // banker's algorithm: a thread with no pending request, or whose request
+    // can be satisfied, will eventually release everything it holds
+    let mut finish = vec![false; ntask];
+    loop {
+        let mut progress = false;
+        for t in 0..ntask {
+            if finish[t] || inner.tasks[t].is_none() {
+                finish[t] = true;
+                continue;
+            }
+            let can_finish = match request[t] {
+                None => true,
+                Some(s) => work[s] > 0,
+            };
+            if can_finish {
+                finish[t] = true;
+                for s in 0..nsem {
+                    work[s] += inner.sem_alloc[t][s];
+                }
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    if finish[tid] {
+        return false;
+    }
+    // deadlock detected: abort all threads that cannot finish
+    let victims: Vec<usize> = (0..ntask)
+        .filter(|&t| inner.tasks[t].is_some() && !finish[t])
+        .collect();
+    // remove them from all the wait queues so that a later `up` will not
+    // wake them up a second time
+    for sem in inner.semaphore_list.iter().flatten() {
+        sem.inner.exclusive_access().wait_queue.retain(|waiting| {
+            match waiting.inner_exclusive_access().res.as_ref() {
+                Some(res) => !victims.contains(&res.tid),
+                None => true,
+            }
+        });
+    }
+    for &victim_tid in victims.iter() {
+        if victim_tid == tid {
+            continue;
+        }
+        let victim = inner.tasks[victim_tid].as_ref().unwrap().clone();
+        {
+            let mut victim_inner = victim.inner_exclusive_access();
+            victim_inner.deadlock_aborted = true;
+            victim_inner.task_status = TaskStatus::Ready;
+        }
+        add_task(victim);
+    }
+    true
 }

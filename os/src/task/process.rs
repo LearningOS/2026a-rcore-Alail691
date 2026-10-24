@@ -49,6 +49,10 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// whether deadlock detection is enabled
+    pub deadlock_detect: bool,
+    /// number of semaphore units held by each thread: `sem_alloc[tid][sem_id]`
+    pub sem_alloc: Vec<Vec<usize>>,
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +85,18 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+    /// Make sure the semaphore allocation table covers every thread and semaphore
+    pub fn ensure_sem_alloc(&mut self) {
+        let nsem = self.semaphore_list.len();
+        while self.sem_alloc.len() < self.tasks.len() {
+            self.sem_alloc.push(vec![0; nsem]);
+        }
+        for row in self.sem_alloc.iter_mut() {
+            while row.len() < nsem {
+                row.push(0);
+            }
+        }
     }
 }
 
@@ -119,6 +135,8 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    sem_alloc: Vec::new(),
                 })
             },
         });
@@ -245,6 +263,8 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    sem_alloc: Vec::new(),
                 })
             },
         });
