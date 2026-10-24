@@ -1,5 +1,6 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -217,6 +218,57 @@ pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
         .translate_va(VirtAddr::from(va))
         .unwrap()
         .get_mut()
+}
+
+/// User virtual addresses must lie in the low canonical half of SV39.
+///
+/// Without this check, an address such as `isize::MAX` would be truncated to
+/// 39 bits and could alias the trampoline page mapped at the top of the
+/// address space.
+fn is_user_va(ptr: usize) -> bool {
+    ptr < (1usize << 38)
+}
+
+/// Translate and copy a byte slice into user space.
+///
+/// All the destination pages are checked before copying, so the copy is
+/// all-or-nothing. Returns `false` if any page is not writable.
+pub fn translated_write_buffer(token: usize, ptr: usize, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    let end = match ptr.checked_add(data.len()) {
+        Some(end) => end,
+        None => return false,
+    };
+    if !is_user_va(ptr) || !is_user_va(end - 1) {
+        return false;
+    }
+    let page_table = PageTable::from_token(token);
+    // first check that every page in the range is mapped and writable
+    let mut addr = ptr;
+    while addr < end {
+        let va = VirtAddr::from(addr);
+        match page_table.translate(va.floor()) {
+            Some(pte) if pte.is_valid() && pte.writable() => {}
+            _ => return false,
+        }
+        addr = ((va.floor().0) + 1) << PAGE_SIZE_BITS;
+    }
+    // then copy page by page
+    let mut start = ptr;
+    let mut copied = 0;
+    while copied < data.len() {
+        let va = VirtAddr::from(start);
+        let pte = page_table.translate(va.floor()).unwrap();
+        let offset = va.page_offset();
+        let n = core::cmp::min(PAGE_SIZE - offset, data.len() - copied);
+        pte.ppn().get_bytes_array()[offset..offset + n]
+            .copy_from_slice(&data[copied..copied + n]);
+        start += n;
+        copied += n;
+    }
+    true
 }
 
 /// An abstraction over a buffer passed from user space to kernel space
